@@ -4,7 +4,6 @@ const { Parser } = require("json2csv");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
-const FormData = require("form-data");
 
 const router = express.Router();
 
@@ -26,8 +25,8 @@ router.get("/export-train", async (req, res) => {
       return res.status(404).json({ error: "No logs found to export" });
     }
 
-    // Convert logs to CSV
-    const fields = ["_id", "ip", "action", "riskScore", "createdAt"];
+    // Keep only fields required by AI service
+    const fields = ["ip", "ua", "path", "method", "body", "label"];
     const parser = new Parser({ fields });
     const csv = parser.parse(logs);
 
@@ -36,13 +35,11 @@ router.get("/export-train", async (req, res) => {
     fs.mkdirSync(path.dirname(exportPath), { recursive: true });
     fs.writeFileSync(exportPath, csv);
 
-    // ✅ Send CSV to AI microservice for retraining
-    const formData = new FormData();
-    formData.append("file", fs.createReadStream(exportPath));
-
-    const aiServiceUrl = process.env.AI_SERVICE_URL || "http://localhost:8000/train";
-    const aiRes = await axios.post(aiServiceUrl, formData, {
-      headers: formData.getHeaders(),
+    // ✅ Tell AI service to train from CSV (send JSON not file)
+    const aiServiceUrl = process.env.AI_SERVICE_URL || "http://127.0.0.1:5001/train";
+    const aiRes = await axios.post(aiServiceUrl, {
+      csv_path: exportPath,
+      label_column: "label"
     });
 
     res.json({

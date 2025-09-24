@@ -11,9 +11,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.metrics import classification_report
 import joblib
-
-# MongoDB
 from pymongo import MongoClient
+from datetime import datetime
 
 # =========================
 # FastAPI App
@@ -32,9 +31,10 @@ RF_PATH     = os.path.join(ARTIFACT_DIR, "rf_pipeline.joblib")
 # =========================
 # MongoDB
 # =========================
-MONGO_URI = "mongodb+srv://machavarapuganesh2004:GaneshMachavarapu@cluster0.dj4kaq9.mongodb.net/AI-deception-sytem"
-MONGO_DB = "Ai-deception-sytem"
-MONGO_COLLECTION = "attacklogs"
+MONGO_URI = "mongodb+srv://machavarapuganesh2004:GaneshMachavarapu@cluster0.dj4kaq9.mongodb.net/"
+MONGO_DB = "AI-deception-sytem"
+RAW_COLLECTION = "rawlogs"         # unlabeled traffic
+LABELED_COLLECTION = "attacklogs"  # labeled feedback data
 
 # =========================
 # Input Schemas
@@ -53,10 +53,6 @@ class TrainConfig(BaseModel):
     label_column: str = "label"
     test_size: float = 0.2
     random_state: int = 42
-
-class FeedbackItem(BaseModel):
-    activity: Activity
-    label: int = Field(..., ge=0, le=1)
 
 # =========================
 # Feature Extraction / Heuristics
@@ -152,7 +148,6 @@ def load_models():
     return logreg, rf
 
 def fallback_models():
-    # Patched fallback to 17 features
     X = np.random.rand(100, 17)
     y = np.array([0] * 50 + [1] * 50)
     logreg = make_pipeline(StandardScaler(), LogisticRegression(max_iter=500))
@@ -189,29 +184,15 @@ def ensemble_final(rule_score: int, probs: dict) -> int:
 # =========================
 @app.post("/analyze")
 def analyze(activity: Activity):
-    # Save activity to MongoDB
-    try:
-        client = MongoClient(MONGO_URI)
-        db = client[MONGO_DB]
-        collection = db[MONGO_COLLECTION]
-        collection.insert_one({
-            "timestamp": int(time.time()),
-            "ip": activity.ip,
-            "ua": activity.ua,
-            "path": activity.path,
-            "method": activity.method,
-            "body": activity.body,
-            "label": None  # unknown until feedback
-        })
-    except Exception as e:
-        print(f"Warning: Could not save to MongoDB: {e}")
-
     feats = extract_features(activity)
     vec = feature_vector(feats)
     rules = rules_score(activity, feats)
     probs = ml_scores(vec)
     final_score = ensemble_final(rules, probs)
     decision = decision_from_score(final_score)
+
+    # Determine auto-label
+    auto_label = 0 if decision == "allow" else 1
 
     reasons: List[str] = []
     if feats["sqli_hits"] > 0: reasons.append("sqli")
@@ -223,9 +204,50 @@ def analyze(activity: Activity):
     if feats["method_susp"] == 1: reasons.append("suspicious-method")
     if feats["method_write"] == 1: reasons.append("write-method")
 
+    try:
+        client = MongoClient(MONGO_URI)
+        db = client[MONGO_DB]
+
+        # Save raw request
+        db[RAW_COLLECTION].insert_one({
+            "timestamp": int(time.time()),
+            "ip": activity.ip,
+            "ua": activity.ua,
+            "path": activity.path,
+            "method": activity.method,
+            "body": activity.body,
+            "decision": decision,
+            "risk": final_score
+        })
+
+        # Save labeled request for training only if not duplicate
+        query = {
+            "ip": activity.ip,
+            "path": activity.path,
+            "method": activity.method,
+            "body": activity.body
+        }
+        if db[LABELED_COLLECTION].count_documents(query) == 0:
+            db[LABELED_COLLECTION].insert_one({
+                "ip": activity.ip,
+                "ua": activity.ua,
+                "path": activity.path,
+                "method": activity.method,
+                "body": activity.body,
+                "event": "",
+                "extra": {},
+                "riskScore": final_score,
+                "decision": decision,
+                "createdAt": datetime.utcnow(),
+                "label": auto_label
+            })
+    except Exception as e:
+        print(f"Warning: Could not save to MongoDB: {e}")
+
     return {
         "risk": final_score,
         "decision": decision,
+        "auto_label": auto_label,
         "reasons": reasons,
         "components": {"rule_score": rules, "logreg_prob": probs["logreg"], "rf_prob": probs["rf"]},
         "features": feats
@@ -240,10 +262,10 @@ def train(cfg: TrainConfig):
     else:
         client = MongoClient(MONGO_URI)
         db = client[MONGO_DB]
-        collection = db[MONGO_COLLECTION]
+        collection = db[LABELED_COLLECTION]
         df = pd.DataFrame(list(collection.find()))
         if df.empty:
-            raise HTTPException(status_code=400, detail="No logs found in MongoDB.")
+            raise HTTPException(status_code=400, detail="No labeled logs found in MongoDB.")
 
     feat_rows, labels = [], []
     for _, row in df.iterrows():
@@ -263,6 +285,9 @@ def train(cfg: TrainConfig):
             "quotes","equals","percents","ampersands","questionmarks",
         ]])
         labels.append(int(row.get(cfg.label_column,0)))
+
+    if len(set(labels)) < 2:
+        raise HTTPException(status_code=400, detail="Need at least 2 classes (0 and 1) to train.")
 
     X, y = np.array(feat_rows, dtype=float), np.array(labels, dtype=int)
     X_train, X_test, y_train, y_test = train_test_split(
@@ -294,27 +319,3 @@ def train(cfg: TrainConfig):
 
     return {"status": "ok", "saved": {"logreg": LOGREG_PATH, "rf": RF_PATH},
             "metrics": {"logreg_report": report_lr, "rf_report": report_rf}}
-
-@app.post("/feedback")
-def feedback(item: FeedbackItem):
-    a = item.activity
-    row = {
-        "timestamp": int(time.time()),
-        "ip": a.ip,
-        "ua": a.ua,
-        "path": a.path,
-        "method": a.method,
-        "body": a.body,
-        "label": item.label
-    }
-
-    # Save feedback into MongoDB
-    try:
-        client = MongoClient(MONGO_URI)
-        db = client[MONGO_DB]
-        collection = db[MONGO_COLLECTION]
-        collection.insert_one(row)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not save feedback to MongoDB: {e}")
-
-    return {"status": "queued", "saved_in": f"{MONGO_DB}.{MONGO_COLLECTION}"}

@@ -10,7 +10,8 @@ const logSchema = new mongoose.Schema({
   extra: { type: Object, default: {} }, // arbitrary metadata
   riskScore: { type: Number, default: 0 },
   decision: { type: String, default: "allow" },
-  createdAt: { type: Date, default: Date.now }
+  createdAt: { type: Date, default: Date.now },
+  label:{type:Number,default:0}
 });
 
 module.exports = mongoose.model("AttackLog", logSchema);
